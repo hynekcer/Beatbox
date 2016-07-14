@@ -118,7 +118,7 @@ class TestSoapEnvelope(unittest.TestCase):
         beatbox.gzipRequest = False
 
     def test_makeEnvelope(self):
-        e = beatbox.SoapEnvelope("http://localhost", "bob", "Beatbox/0.96")
+        e = beatbox.SoapEnvelope("bob", "Beatbox/0.96")
         env = e.makeEnvelope()
         self.assertEqual(
             soapEnvElement +
