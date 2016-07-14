@@ -1,14 +1,22 @@
 """beatbox: Makes the salesforce.com SOAP API easily accessible."""
+# The name of module is "_beatbox" because the same name in the package
+# "beatbox" would be problematic.
 from __future__ import print_function
 
-from beatbox_six import BytesIO, http_client, text_type, urlparse, xrange
 import gzip
 import datetime
-import xmltramp
-from xmltramp import islst
+import re
+import functools
+import time
+from collections import namedtuple
 from xml.sax.saxutils import XMLGenerator
 from xml.sax.saxutils import quoteattr
 from xml.sax.xmlreader import AttributesNSImpl
+
+import beatbox
+from beatbox.six import BytesIO, http_client, text_type, urlparse, xrange
+from beatbox import xmltramp
+from beatbox.xmltramp import islst
 
 __version__ = "0.96"
 __author__ = "Simon Fell"
@@ -26,15 +34,10 @@ _tPartnerNS = xmltramp.Namespace(_partnerNs)
 _tSObjectNS = xmltramp.Namespace(_sobjectNs)
 _tSoapNS = xmltramp.Namespace(_envNs)
 
-# global config
-gzipRequest = True    # are we going to gzip the request ?
-gzipResponse = True   # are we going to tell the server to gzip the response ?
-forceHttp = False     # force all connections to be HTTP, for debugging
-
 
 def makeConnection(scheme, host, timeout=1200):
     kwargs = {'timeout': timeout}
-    if forceHttp or scheme.upper() == 'HTTP':
+    if beatbox.forceHttp or scheme.upper() == 'HTTP':
         return http_client.HTTPConnection(host, **kwargs)
     return http_client.HTTPSConnection(host, **kwargs)
 
@@ -282,6 +285,235 @@ class IterClient(Client):
                 yield response
 
 
+# === End of public interface ===
+
+# (everything below is private, even without leading underscore)
+
+
+# Error types
+
+class SoapFaultError(Exception):
+    """Exception class for soap faults."""
+    def __init__(self, faultCode, faultString):
+        self.faultCode = faultCode
+        self.faultString = faultString
+
+    def __str__(self):
+        return repr(self.faultCode) + " " + repr(self.faultString)
+
+
+class SoapInvalidSession(SoapFaultError):
+    pass  # a new login should help
+
+
+class SoapInvalidLogin(SoapFaultError):
+    pass  # a new login can't help
+
+
+# Authentication class
+
+class AuthInfo(object):
+
+    # If the login failed, e.g due to changed password, it should not be retried
+    # too frequently to prevent assount locking. The best is to fix password,
+    # allowed IP addres range etc. and restart the process (web server) or to call
+    # login method explicitely.
+    safe_login_retry_delay = 600
+
+    def __init__(self, connection_factory=None):
+        self.connection_factory = connection_factory
+        self.session_id = None
+        self.worker_server_url = None
+        self.is_sandbox = None
+        self._auth_request_body = None
+        self.failed_timestamp = None
+
+    def login(self, username, password, is_sandbox=None):
+        self.is_sandbox = is_sandbox
+        self._auth_request_body = LoginRequest(username, password)
+        self.failed_timestamp = None
+        return self.reauth()
+
+    def portalLogin(self, username, password, orgId, portalId, is_sandbox=None):
+        self.is_sandbox = is_sandbox
+        self._auth_request_body = PortalLoginRequest(username, password, orgId, portalId)
+        self.failed_timestamp = None
+        return self.reauth()
+
+    def useSession(self, sessionId, serverUrl):
+        self.session_id = sessionId
+        self.worker_server_url = serverUrl
+        self._auth_request_body = None
+        self.failed_timestamp = None
+
+    def reauth(self):
+        """Get a new sessionId (re-authenticate)
+
+        If the last login failed (not expired) then the login request
+        is never repeated automatically, until a succesfull login or
+        until a safe delay expires - to prevent account locking.
+        The login request is never repeated automatically after logout in the same process.
+        """
+        if not self._auth_request_body:
+            raise RuntimeError("Connection to SFDC not authenticated")
+        if self.failed_timestamp and time.time() < self.failed_timestamp < self.safe_login_retry_delay:
+            raise SoapInvalidLogin("The same Login shouldn't be retried automatically too soon after failed login")
+        if self.is_sandbox is not None:
+            self.login_server_url = re.sub(r'(?<=https://)(test|login)(?=\.salesforce\.com/)',
+                                           'test' if self.is_sandbox else 'login', self.login_server_url)
+        conn = SoapLoginConnection(self.login_server_url, connection_factory=self.connection_factory)
+        try:
+            lr = conn.post(self._auth_request_body)
+        except SoapInvalidLogin:
+            self.failed_timestamp = time.time()
+            raise
+        finally:
+            conn.close()
+        self.useSession(str(lr[_tPartnerNS.sessionId]), str(lr[_tPartnerNS.serverUrl]))
+        return lr
+
+    def invalidate(self):
+        """Forget auth information"""
+        self._auth_request_body = None
+        self.session_id = None
+
+
+# TODO move...
+class AuthInfoMinimal(object):
+    """Prototype of authentication data and methods
+
+    The class must implement at least one authentication method that sets
+    attributes `session_id` and `worker_server_url`, e.g. login or some
+    OAuth2 methods.
+    All other attributes are considered private.
+    An optional method `reauth` can be implemented that allows to
+    automatically renew an expired session_id from some private data.
+    """
+
+    def __init__(self):
+        self.session_id = None
+        self.worker_server_url = None
+
+    def login(self, username, password, is_sandbox=False):
+        # self.session_id = ...
+        # self._auth_request_body = ...
+        raise NotImplementedError("An authenication method is to be implemented")
+
+
+# classes for network connection (to worker server, to login server and a universal code)
+
+class BaseSoapConnection(object):
+    """Universal client for SOAP requests to the login server or worker server."""
+
+    def __init__(self, auth=None, login_server_url=None, connection_factory=None):
+        self.auth = auth
+        self.login_server_url = login_server_url
+        self.connection_factory = connection_factory or makeConnection
+        self.conn = None
+
+    @property
+    def server_url(self):
+        return self.auth.worker_server_url if self.auth else self.login_server_url
+
+    def connect(self):
+        """Connect if not connected"""
+        if self.conn is None:
+            (scheme, host, path, params, query, frag) = urlparse(self.server_url)
+            self.conn = self.connection_factory(scheme, host)
+
+    def post2r(self, envelope_creator_method, obj, *args, **kwargs):
+        """Call post method and exception handling with possible 2x retry"""
+        retry = 1
+        while True:
+            envelope = envelope_creator_method(obj, *args, **kwargs)
+            try:
+                return self.post(envelope)
+            except SoapInvalidSession:
+                # the request is not retried (should not be) if login request after INVALID_LOGIN
+                if retry < 2 and hasattr(self.auth, 'reauth'):
+                    self.auth.reauth()
+                    retry += 1
+                else:
+                    raise
+
+    def post(self, envelope):
+        """Complete the envelope and send the request
+
+        does all the grunt work,
+          serializes the envelope object,
+          makes a http request,
+          passes the response to xmltramp
+          checks for soap fault
+          todo: check for mU='1' headers
+          returns the relevant result from the body child
+        """
+        http_headers = {"User-Agent": "BeatBox/" + __version__,
+                        "SOAPAction": '""',
+                        "Content-Type": "text/xml; charset=utf-8"}
+        if beatbox.gzipResponse:
+            http_headers['accept-encoding'] = 'gzip'
+        if beatbox.gzipRequest:
+            http_headers['content-encoding'] = 'gzip'
+
+        closed = self.conn is None
+        if closed:
+            self.connect()
+
+        rawRequest = envelope.makeEnvelope()
+        # print(rawRequest)
+
+        # Possible network exceptions in these two commands are:
+        # ConnectionResetError (builtin exception raised from ssl module in Python 3)
+        # http.client.CannotSendRequest
+        self.conn.request("POST", self.server_url, rawRequest, http_headers)
+        response = self.conn.getresponse()
+        rawResponse = response.read()
+        if response.getheader('content-encoding', '') == 'gzip':
+            rawResponse = gzip.GzipFile(fileobj=BytesIO(rawResponse)).read()
+        if closed and isinstance(self, SoapLoginConnection):
+            self.close()
+        tramp = xmltramp.parse(rawResponse)
+        response_body = tramp[_tSoapNS.Body]
+        try:
+            fault = response_body[_tSoapNS.Fault]
+        except KeyError:
+            pass
+        else:
+            faultString = str(fault.faultstring)
+            faultCode = str(fault.faultcode).split(':')[-1]
+            error_map = {'sf:INVALID_SESSION_ID': SoapInvalidSession,
+                         'sf:INVALID_LOGIN': SoapInvalidLogin,
+                         }
+            raise error_map.get(faultCode, SoapFaultError)(faultCode, faultString)
+        return envelope.decode_response(response_body)
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+
+    def __del__(self):
+        self.close()
+
+
+class SoapLoginConnection(BaseSoapConnection):
+    """Client for SOAP requests to the login server."""
+
+    def __init__(self, login_server_url, connection_factory=None):
+        super(SoapLoginConnection, self).__init__(login_server_url=login_server_url,
+                                                  connection_factory=connection_factory)
+
+
+class SoapWorkerConnection(BaseSoapConnection):
+    """Client for SOAP requests to the worker server."""
+
+    def __init__(self, auth, connection_factory=None):
+        super(SoapWorkerConnection, self).__init__(auth=auth,
+                                                   connection_factory=connection_factory)
+
+
+# classes for writing XML output (used by SoapEnvelope)
+
 class BeatBoxXmlGenerator(XMLGenerator):
     """Fixed version of XmlGenerator, handles unqualified attributes correctly."""
     def __init__(self, destination, encoding):
@@ -382,7 +614,7 @@ class SoapWriter(XmlWriter):
     __xsiNs = "http://www.w3.org/2001/XMLSchema-instance"
 
     def __init__(self):
-        XmlWriter.__init__(self, gzipRequest)
+        XmlWriter.__init__(self, beatbox.gzipRequest)
         self.startPrefixMapping("s", _envNs)
         self.startPrefixMapping("p", _partnerNs)
         self.startPrefixMapping("o", _sobjectNs)
