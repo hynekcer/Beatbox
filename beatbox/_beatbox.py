@@ -460,19 +460,26 @@ class BaseSoapConnection(object):
             self.connect()
 
         rawRequest = envelope.makeEnvelope()
-        # print(rawRequest)
+
+        print("**** req: %s **" % rawRequest[:2000])
 
         # Possible network exceptions in these two commands are:
         # ConnectionResetError (builtin exception raised from ssl module in Python 3)
         # http.client.CannotSendRequest
         self.conn.request("POST", self.server_url, rawRequest, http_headers)
         response = self.conn.getresponse()
+
         rawResponse = response.read()
         if response.getheader('content-encoding', '') == 'gzip':
             rawResponse = gzip.GzipFile(fileobj=BytesIO(rawResponse)).read()
         if closed and isinstance(self, SoapLoginConnection):
             self.close()
         tramp = xmltramp.parse(rawResponse)
+
+        out = tramp.__repr__(1, 1)
+        print("*** resp: %s **" % (out if len(out) <= 2000 else out[:1500] + ' ** ... ** ' + out[-500:]),
+              b'<size>' in rawResponse)
+
         response_body = tramp[_tSoapNS.Body]
         try:
             fault = response_body[_tSoapNS.Fault]
