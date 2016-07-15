@@ -42,6 +42,43 @@ def makeConnection(scheme, host, timeout=1200):
     return http_client.HTTPSConnection(host, **kwargs)
 
 
+def post_request_envelope(envelope_creator_method):
+    """Decorator for repeating some methods of Client if sessionId has expired.
+
+    The decorated method `envelope_creator_method` creates only the envelope
+    of Soap request.
+    The decorator sends the request by https POST, handles some exceptions
+    and decodes the response body. If an exception is raised (that the sessionId
+    has been expired or invalidated at SFDC by some means, a new login can be
+    performed and the AuthenticatedRequest repeated with the new sessionId.
+    """
+    @functools.wraps(envelope_creator_method)
+    def wrapper(self, *args, **kwargs):
+        return self._Client__conn.post2r(envelope_creator_method, self, *args, **kwargs)
+    return wrapper
+
+
+def combine_headers(headers_1, headers_2):
+    """Combine two sets of request headers
+
+    Setting the value to None will delete the previous header.
+    """
+    out = headers_1.copy()
+    if headers_2 is not None:
+        out.update(headers_2)
+        for x in [k for k, v in out.items() if v is None]:
+            del out.headers[x]
+    return out
+
+
+class NetInfo(object):
+    def __init__(self, conn=None, timeout=15, headers=None, connection_factory=makeConnection):
+        self.conn = conn
+        self.timeout = timeout
+        self.headers = headers or {}
+        self.connection_factory = connection_factory
+
+
 class Client(object):
     """The main sforce client proxy class."""
     def __init__(self):
@@ -49,17 +86,48 @@ class Client(object):
         self.serverUrl = "https://login.salesforce.com/services/Soap/u/36.0"
         self.__conn = None
         self.timeout = 15
-        self.headers = {}
+        self.headers = {}  # SOAP headers
+        self.connection_factory = connection_factory
+        self.net = NetInfo()
 
+    @property
+    def serverUrl(self):
+        return self.auth.login_server_url
+
+    # ??? really
     def __del__(self):
-        if self.__conn:
-            self.__conn.close()
+        if self.net.conn:
+            self.net.conn.close()
 
-    def login(self, username, password):
-        """"Login.  returns the loginResult structure"""
-        lr = LoginRequest(self.serverUrl, username, password).post()
-        self.useSession(str(lr[_tPartnerNS.sessionId]), str(lr[_tPartnerNS.serverUrl]))
-        return lr
+    def using(self, headers=None):
+        """Set headers until the end of one command
+
+        Setting the value to None will delete the header defined on the previous
+        level without assigning a new value
+        """
+        copy = Client()
+        copy.__dict__ = self.__dict__.copy()
+        # http.client is not prepared for setting timeout after connection,
+        # but it's possible by socket.settimeout
+        # if timeout is not None:
+        #     copy.net.timeout = timeout
+        copy.net.headers = combine_headers(copy.net.headers, headers)
+        return copy
+
+    @serverUrl.setter
+    def serverUrl(self, value):
+        self.auth.login_server_url = value
+
+    @property
+    def _envel_info(self):
+        """Arguments that should be passed to the typical SoapEnvelope subclasses."""
+        return EnvelopeInfo(session_id=self.auth.session_id, headers=self.headers)
+
+    def login(self, username, password, is_sandbox=None):
+        """"Login.  Returns the loginResult structure"""
+        ret = self.auth.login(username, password, is_sandbox=is_sandbox)
+        self.__conn = SoapWorkerConnection(self.auth, connection_factory=self.net.connection_factory)
+        return ret
 
     def portalLogin(self, username, password, orgId, portalId):
         """Perform a portal login.
@@ -70,19 +138,17 @@ class Client(object):
         get API access, for new portals, the users should have API acesss, and can call the rest
         of the API.
         """
-        lr = PortalLoginRequest(self.serverUrl, username, password, orgId, portalId).post()
-        self.useSession(str(lr[_tPartnerNS.sessionId]), str(lr[_tPartnerNS.serverUrl]))
-        return lr
+        ret = self.auth.portalLogin(username, password, orgId, portalId, is_sandbox=is_sandbox)
+        self.__conn = SoapWorkerConnection(self.auth, connection_factory=self.net.connection_factory)
+        return ret
 
     def useSession(self, sessionId, serverUrl):
         """Initialize from an existing sessionId & serverUrl
 
         Useful if we're being launched via a custom link
         """
-        self.sessionId = sessionId
-        self.__serverUrl = serverUrl
-        (scheme, host, path, params, query, frag) = urlparse(self.__serverUrl)
-        self.__conn = makeConnection(scheme, host)
+        self.auth.useSession(self, sessionId, serverUrl)
+        self.__conn = SoapWorkerConnection(self.auth, connection_factory=self.net.connection_factory)
 
     def logout(self):
         """Calls logout which invalidates the current sessionId.
