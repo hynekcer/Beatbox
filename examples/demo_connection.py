@@ -89,23 +89,59 @@ class ResponseWrapper(object):
             return self.response.headers.get(name, default)
 
 
+def get_oauth2_session_by_passw(username, password, is_sandbox):
+    """This is for a demo for "Username and Password Flow" in OAuth 2.0
+
+    Though this "Username and Password" authentication flow has no advantage
+    over the standard SOAP authentication, this is useful for demo. OAuth 2.0
+    has six different authentication flows. Assume that in fact we know the
+    OAuth2 session from an external app that does not use the password.
+    """
+    url = 'https://%s.salesforce.com/services/oauth2/token' % ('test' if is_sandbox else 'login')
+    data = {'grant_type': 'password',
+            'username': username,
+            'password': password,
+            'client_id': os.environ['CLIENT_ID'],
+            'client_secret': os.environ['CONSUMER_SECRET'],
+            }
+    response = requests.post(url, data=data)
+    if response.status_code == 200:
+        response_data = response.json()
+    else:
+        import pdb; pdb.set_trace()
+        raise RuntimeError('OAuth failed')
+
+    access_token = response_data['access_token']
+    url = response_data['id']
+    headers = {"Authorization": "OAuth " + access_token}
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        response_data2 = response.json()
+    else:
+        import pdb; pdb.set_trace()
+        raise RuntimeError('OAuth failed')
+
+    return {'access_token': access_token, 'url': response_data2['urls']['partner']}, response_data, response_data2
+
+
 def main():
     svc = beatbox.Client()
     beatbox.gzipRequest = False
-    if 'SF_SANDBOX' in os.environ:
-        svc.serverUrl = svc.serverUrl.replace('login.salesforce', 'test.salesforce')
+    is_sandbox = 'SF_SANDBOX' in os.environ
     username, password = sys.argv[1], sys.argv[2]
 
     svc.connection_factory = RequestsConnectionFactory
-    svc.login(username, password)
+    ret = get_oauth2_session_by_passw(username, password, is_sandbox)
 
+    svc.useSession(ret[0]['access_token'], 'https://cs7.salesforce.com/services/Soap/u/36.0/00DM0000001eBkw')
+    # svc.login(username, password, is_sandbox)
     qr = svc.query("select Id, Name from Account limit 1")
     sf = beatbox._tPartnerNS
     row = qr[sf.records:][0]
     print('%s: %s' % (row[2], row[3]))
 
     svc.connection_factory = HttpConnectionFactory
-    svc.login(username, password)
+    svc.login(username, password, is_sandbox)
 
     qr = svc.query("select Id, Name from Account limit 1")
     sf = beatbox._tPartnerNS

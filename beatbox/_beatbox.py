@@ -148,7 +148,7 @@ class Client(object):
 
         Useful if we're being launched via a custom link
         """
-        self.auth.useSession(self, sessionId, serverUrl)
+        self.auth.useSession(sessionId, serverUrl)
         self.__conn = SoapWorkerConnection(self.auth, connection_factory=self.net.connection_factory)
 
     def logout(self):
