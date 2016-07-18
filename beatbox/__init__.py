@@ -1,12 +1,12 @@
 from beatbox._beatbox import (                       # NOQA
-        Client,  IterClient, SoapFaultError, islst,  # really public
+        Client, IterClient, SoapFaultError, islst,   # really public
         _tPartnerNS, _tSObjectNS, _envNs, _noAttrs,  # low level for a Python client
         XmlWriter, SoapWriter, SoapEnvelope,         # low level for tests
         Client as XMLClient,
         )
 from beatbox.python_client import Client as PythonClient
 
-__all__ = ('Client',  'IterClient', 'SoapFaultError', 'islst')
+__all__ = ('Client', 'PythonClient', 'IterClient', 'SoapFaultError', 'islst')
 
 # global config - probably no reason to change them except in tests
 gzipRequest = True    # are we going to gzip the request ?
