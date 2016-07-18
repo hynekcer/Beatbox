@@ -40,9 +40,9 @@ def makeConnection(scheme, host, timeout=1200):
 
 class Client(object):
     """The main sforce client proxy class."""
-    def __init__(self):
+    def __init__(self, serverUrl=None):
         self.batchSize = 500
-        self.serverUrl = "https://login.salesforce.com/services/Soap/u/36.0"
+        self.serverUrl = serverUrl or "https://login.salesforce.com/services/Soap/u/36.0"
         self.__conn = None
         self.timeout = 15
         self.headers = {}
@@ -51,8 +51,10 @@ class Client(object):
         if self.__conn:
             self.__conn.close()
 
-    def login(self, username, password):
+    def login(self, username, password, is_sandbox=None):
         """"Login.  returns the loginResult structure"""
+        if is_sandbox:
+            self.serverUrl = self.serverUrl.replace('login.', 'test.')
         lr = LoginRequest(self.serverUrl, username, password).post()
         self.useSession(str(lr[_tPartnerNS.sessionId]), str(lr[_tPartnerNS.serverUrl]))
         return lr
