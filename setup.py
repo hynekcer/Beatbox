@@ -9,7 +9,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="beatbox",
-    version="0.96",
+    version="0.97a0",
     test_suite="beatbox",
     description="Makes the salesforce.com SOAP API easily accessible.",
     author="Simon Fell",
